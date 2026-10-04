@@ -56,10 +56,56 @@ KB = {
     "other": "Give general, cautious advice and recommend a healthcare professional if symptoms persist or worsen.",
 }
 
+TOPIC_WORDS = [
+    ("fainting", r"behosh|faint|passed out|black ?out|بے ?ہوش|بیہوش"),
+    ("blood_sugar", r"sugar|glucose|diabet|shugar|شوگر"),
+    ("blood_pressure", r"\bbp\b|blood pressure|بی پی"),
+    ("fever", r"bukhar|bukhaar|fever|بخار"),
+    ("vomiting_diarrhea", r"ulti|dast|vomit|diarrh|loose motion|الٹی|دست"),
+    ("cough", r"khansi|cough|کھانسی"),
+    ("headache", r"sar (mein )?dard|headache|سر (میں )?درد"),
+    ("minor_burn", r"jal gay|jhulas|burn|جل گ"),
+    ("dehydration", r"pyaas|dehydrat|garmi|پیاس"),
+    ("dizziness", r"chakkar|dizz|ghoom|چکر"),
+    ("weakness", r"kamzori|weak|thakan|tired|fatigue|vitamin|khoon ki kami|anemi|anaemi|کمزوری|تھکن"),
+]
+
+
+def guess_topic(text: str) -> str:
+    t = text.lower()
+    for topic, pat in TOPIC_WORDS:
+        if re.search(pat, t):
+            return topic
+    return "other"
+
+
+def guess_lang(text: str) -> str:
+    if re.search(r"[\u0600-\u06FF]", text):
+        return "ur"
+    if re.search(r"\b(mujhe|mera|meri|hai|hain|nahi|rahi|raha|aur|bohat|kya|ho)\b", text.lower()):
+        return "roman_ur"
+    return "en"
+
+
+def standard_guidance(topic: str, risk: str, text: str) -> dict:
+    """Used only when the AI service is unavailable: vetted guideline text, in English."""
+    body = KB[topic]
+    steps_part, _, red_part = body.partition("Red flags:")
+    steps = [x.strip().rstrip(".") + "." for x in steps_part.split(". ") if x.strip()][:5]
+    red = [x.strip() for x in re.split(r",| or ", red_part.strip().rstrip(".")) if x.strip()][:5]
+    red += ["Symptoms getting worse, or any new serious symptom"]
+    nxt = ("Please see a healthcare professional today (nearest clinic, health centre or hospital)." if risk == "yellow"
+           else "Monitor at home. If it is not better within 48 hours, or any warning sign appears, see a healthcare professional.")
+    return {"understood": f'You told us: "{text[:160]}"',
+            "relevant": "These symptoms can be associated with several causes. Only a healthcare professional can find the cause, so please do not rely on a guess.",
+            "to_check": ["Blood pressure, glucose and temperature, if you can measure them"],
+            "do_now": steps, "warning_signs": red, "next_step": nxt, "degraded": True}
+
+
 # ---------------------------------------------------------------- safety rules (work without the LLM)
 RED_FLAGS = {
     "Chest pain or pressure": r"(chest (pain|tight|pressure)|seene (mein|me|main) (dard|bhari|jakar)|seena dard|dil (mein|me) dard|سینے (میں )?(درد|بھاری))",
-    "Difficulty breathing": r"(saans (lene )?(mein|me|main) (bohat |boht |shadeed )?(mushkil|dikkat|takleef)|saans phool|dum ghut|can'?t breathe|difficulty breathing|short(ness)? of breath|سانس (لینے )?(میں )?(مشکل|تکلیف|پھول))",
+    "Difficulty breathing": r"(saans (lene )?(mein|me|main) (bohat |boht |shadeed )?(mushkil|dikkat|takleef)|saans phool|saans nahi (aa|le|ar)|saans ruk|dum ghut|can'?t breathe|cannot breathe|difficulty breathing|short(ness)? of breath|سانس (لینے )?(میں )?(مشکل|تکلیف|پھول))",
     "Unconscious / not responding": r"(unresponsive|not responding|still unconscious|abhi (bhi )?behosh|behosh hai|jawab nahi de)",
     "Seizure": r"(seizure|convulsion|\bfits\b|daura|mirgi|مرگی|دورہ)",
     "Possible stroke signs": r"(face droop|chehra tedha|munh tedha|bolne (mein|me) (mushkil|dikkat)|slurred|ek (taraf|side) (se |ki )?(kamzori|sunn)|one side weak|منہ ٹیڑھا)",
@@ -69,15 +115,27 @@ RED_FLAGS = {
     "Thoughts of self-harm": r"(suicide|khudkushi|kill myself|marna chahta|marna chahti|خودکشی)",
 }
 WATCH_FLAGS = {"Fainting / loss of consciousness": r"(behosh|bayhosh|fainted|passed out|faint|black ?out|بے ?ہوش|بیہوش)"}
-NEG = re.compile(r"^[\s,.:;\-]*(?:\S+[\s,]+){0,3}?(?:nahi|nahin|nhi|not|never|no|نہیں)(?:\W|$)", re.I)
+NEG = re.compile(r"^\s*(?:\S+\s+){0,2}?(?:nahi|nahin|nhi|not|never|no|نہیں)(?:\W|$)", re.I)
+
+
+NEG_BEFORE = re.compile(r"(?:\bno|\bwithout|\bbina|\bkoi|بغیر|کوئی)\s+$", re.I)
+CLAUSE_END = re.compile(r"\b(aur|and|but|lekin|magar|par|bas|jabke|while)\b|[.;,!?\n]", re.I)
 
 
 def scan(text: str, flags: Dict[str, str]) -> List[str]:
+    """A flag is ignored only if a negation word follows it IN THE SAME CLAUSE ('chest pain nahi hai')."""
     t = text.lower()
     hits = []
     for name, pat in flags.items():
-        if any(not NEG.search(t[m.end(): m.end() + 28]) for m in re.finditer(pat, t, re.I)):
-            hits.append(name)
+        for m in re.finditer(pat, t, re.I):
+            after = t[m.end(): m.end() + 28]
+            cut = CLAUSE_END.search(after)
+            if cut:
+                after = after[: cut.start()]
+            before = t[max(0, m.start() - 10): m.start()]
+            if not NEG.search(after) and not NEG_BEFORE.search(before):
+                hits.append(name)
+                break
     return hits
 
 
@@ -152,6 +210,7 @@ class State(TypedDict, total=False):
     final: str
     kind: str
     trace: List[str]
+    llm_error: str
 
 
 def log(s: State, msg: str) -> List[str]:
@@ -167,16 +226,21 @@ Never diagnose. Never invent facts."""
 
 
 def intake_agent(s: State):
+    err = ""
     try:
         d = ask_json(INTAKE_SYSTEM, f"Age group: {s['age_group']}\nMeasured values: {s['measures']}\nUser text: {s['text']}", 500)
     except Exception as e:
-        d = {}
+        d, err = {}, f"{type(e).__name__}: {str(e)[:220]}"
     lang = s.get("lang_pref") if s.get("lang_pref") in LANG_NAMES else d.get("language")
-    topic = d.get("topic") if d.get("topic") in KB else "other"
-    return {"language": lang if lang in LANG_NAMES else "roman_ur", "symptoms": d.get("symptoms") or [],
-            "duration": d.get("duration") or "", "guesses": d.get("guesses") or [], "topic": topic,
-            "llm_emergency": d.get("emergency_suspected") or "", "needs_doctor": bool(d.get("needs_doctor")),
-            "trace": log(s, f"Intake Agent: topic={topic}, symptoms={d.get('symptoms')}")}
+    topic = d.get("topic") if d.get("topic") in KB and d.get("topic") != "other" else guess_topic(s["text"])
+    symptoms = d.get("symptoms") or ([topic.replace("_", " ")] if topic != "other" else [])
+    out = {"language": lang if lang in LANG_NAMES else guess_lang(s["text"]), "symptoms": symptoms,
+           "duration": d.get("duration") or "", "guesses": d.get("guesses") or [], "topic": topic,
+           "llm_emergency": d.get("emergency_suspected") or "", "needs_doctor": bool(d.get("needs_doctor")),
+           "trace": log(s, f"Intake Agent: topic={topic}, symptoms={symptoms}" + (" (AI unavailable: rule-based fallback)" if err else ""))}
+    if err:
+        out["llm_error"] = err
+    return out
 
 
 def triage_agent(s: State):
@@ -217,11 +281,20 @@ def advice_agent(s: State):
     user = json.dumps({"complaint": s["text"], "age_group": s["age_group"], "symptoms": s.get("symptoms"), "duration": s.get("duration"),
                        "measured_values": s.get("measures"), "user_guesses": s.get("guesses"), "risk": s["risk"],
                        "flags": s["yellow"], "GUIDELINES": KB[s["topic"]]}, ensure_ascii=False)
+    err = ""
     try:
         a = ask_json(ADVICE_SYSTEM.format(lang=LANG_NAMES[s["language"]]), user, 1400)
-    except Exception:
-        a = {}
-    return {"advice": a, "trace": log(s, "Advice Agent: guidance generated from guidelines")}
+    except Exception as e:
+        a, err = {}, f"{type(e).__name__}: {str(e)[:220]}"
+    if not (a.get("do_now") and a.get("warning_signs") and a.get("next_step")):
+        a = standard_guidance(s["topic"], s["risk"], s["text"])
+        note = "Advice Agent: AI unavailable, using vetted standard guidance (English)"
+    else:
+        note = "Advice Agent: guidance generated from guidelines"
+    out = {"advice": a, "trace": log(s, note)}
+    if err:
+        out["llm_error"] = err
+    return out
 
 
 def referral_agent(s: State):
@@ -247,12 +320,15 @@ def referral_agent(s: State):
 
 DOSE = re.compile(r"\b\d+(\.\d+)?\s?(mg|mcg|iu)\b", re.I)
 DIAG = re.compile(r"\byou (definitely )?(have|are suffering from) (low|high|diabetes|anemia|anaemia|a deficiency|vitamin|iron)", re.I)
-CHECK_SYSTEM = """You are a Safety Checker. Compare the ADVICE with the GUIDELINES. FAIL only if the advice: states a diagnosis as fact, gives medicine doses or tells the user to start/stop/change medicines,
-adds steps not in the guidelines, or lacks warning signs / falsely reassures. Return ONLY JSON {"pass": true|false, "issues": []}."""
+CHECK_SYSTEM = """You are a Safety Checker. Compare the ADVICE with the GUIDELINES. FAIL only for a serious problem: the advice states a diagnosis as fact,
+gives medicine doses, tells the user to start/stop/change medicines, contradicts the guidelines, or falsely reassures an urgent case. Minor wording differences, translation style or
+extra general comfort measures are NOT failures. Return ONLY JSON {"pass": true|false, "issues": []}."""
 
 
 def safety_agent(s: State):
     a = s.get("advice") or {}
+    if a.get("degraded"):  # vetted static text: no AI check needed, shown in English
+        return {"language": "en", "kind": "guidance", "trace": log(s, "Safety Checker: skipped (vetted standard guidance)")}
     text = json.dumps(a, ensure_ascii=False)
     issues = []
     if not a.get("warning_signs") or not a.get("next_step") or not a.get("do_now"):
@@ -268,8 +344,9 @@ def safety_agent(s: State):
                 issues += r.get("issues") or ["checker did not approve"]
         except Exception as e:
             issues.append(f"checker unavailable: {e}")
+            s = {**s, "llm_error": s.get("llm_error") or f"{type(e).__name__}: {str(e)[:220]}"}
     if issues:
-        return {"final": FALLBACK_MSG[s["language"]].format(n=EMERGENCY), "kind": "fallback",
+        return {"final": FALLBACK_MSG[s["language"]].format(n=EMERGENCY), "kind": "fallback", "llm_error": s.get("llm_error", ""),
                 "trace": log(s, f"Safety Checker: FAIL {issues} -> safe fallback")}
     h = HEAD[s["language"]]
     bullets = lambda xs: "\n".join(f"- {x}" for x in xs)
