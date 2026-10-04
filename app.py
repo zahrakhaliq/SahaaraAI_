@@ -133,8 +133,14 @@ if go:
     with st.spinner("Analysing your symptoms..."):
         out = graph().invoke({"text": text, "age_group": AGES[age], "lang_pref": LANGS[lang],
                               "measures": measures, "trace": []})
-    risk = out["risk"] if out["kind"] != "fallback" else "yellow"
-    st.markdown(f'<div class="verdict v-{risk}"><div class="t">{TITLE[risk]}</div><div class="s">{SUB[risk]}</div></div>',
+    if out.get("llm_error"):
+        st.error("⚠️ The AI service had a problem, so some results use built-in rules and standard guidance (English). "
+                 f"Details: `{out['llm_error']}`. Please check GROQ_API_KEY under Settings → Secrets.")
+    risk = out["risk"]
+    title, sub = TITLE[risk], SUB[risk]
+    if out["kind"] == "fallback":
+        title, sub = "Guidance could not be generated", "Please see a healthcare professional today."
+    st.markdown(f'<div class="verdict v-{risk}"><div class="t">{title}</div><div class="s">{sub}</div></div>',
                 unsafe_allow_html=True)
     st.markdown(f'<div class="chips"><span>Topic: {html.escape(str(out.get("topic", "-")))}</span>'
                 f'<span>Language: {html.escape(str(out.get("language", "-")))}</span>'
