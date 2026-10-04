@@ -13,6 +13,7 @@ from typing import Any, Dict, List, TypedDict
 from groq import Groq
 from langgraph.graph import END, StateGraph
 
+VERSION = "2026-10-04-v3"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 EMERGENCY = "1122 / 115"
 LANG_NAMES = {"en": "simple English", "ur": "Urdu (Urdu script)", "roman_ur": "Roman Urdu (Urdu in Latin letters)"}
@@ -38,6 +39,17 @@ def ask_json(system: str, user: str, max_tokens: int = 1200) -> dict:
     except Exception:
         m = re.search(r"\{.*\}", text, re.S)
         return json.loads(m.group(0)) if m else {}
+
+
+def diagnose() -> dict:
+    """Tiny live test of the Groq connection (used by the Diagnostics panel in the UI)."""
+    info = {"version": VERSION, "model": MODEL}
+    try:
+        info["reply"] = ask_json('Reply with JSON {"ok": true}', "ping", 20)
+        info["status"] = "AI connection works"
+    except Exception as e:
+        info["status"] = f"AI connection FAILED: {type(e).__name__}: {str(e)[:300]}"
+    return info
 
 
 # ---------------------------------------------------------------- small knowledge base (grounding)
@@ -211,6 +223,7 @@ class State(TypedDict, total=False):
     kind: str
     trace: List[str]
     llm_error: str
+    safety_note: str
 
 
 def log(s: State, msg: str) -> List[str]:
@@ -325,6 +338,13 @@ gives medicine doses, tells the user to start/stop/change medicines, contradicts
 extra general comfort measures are NOT failures. Return ONLY JSON {"pass": true|false, "issues": []}."""
 
 
+def _passed(r: dict) -> bool:
+    p = r.get("pass", r.get("passed", r.get("safe")))
+    if isinstance(p, str):
+        p = p.strip().lower() in ("true", "yes", "pass", "passed", "safe")
+    return bool(p) if p is not None else not r.get("issues")
+
+
 def safety_agent(s: State):
     a = s.get("advice") or {}
     if a.get("degraded"):  # vetted static text: no AI check needed, shown in English
@@ -337,24 +357,23 @@ def safety_agent(s: State):
         issues.append("medicine dose found")
     if DIAG.search(text):
         issues.append("diagnosis stated as fact")
+    err = s.get("llm_error", "")
     if not issues:
         try:
             r = ask_json(CHECK_SYSTEM, json.dumps({"GUIDELINES": KB[s["topic"]], "ADVICE": a}, ensure_ascii=False), 300)
-            if r.get("pass") is not True:
-                issues += r.get("issues") or ["checker did not approve"]
+            if not _passed(r):
+                issues += [str(i) for i in (r.get("issues") or ["checker did not approve"])]
         except Exception as e:
-            issues.append(f"checker unavailable: {e}")
-            s = {**s, "llm_error": s.get("llm_error") or f"{type(e).__name__}: {str(e)[:220]}"}
+            issues.append("checker unavailable")
+            err = err or f"{type(e).__name__}: {str(e)[:220]}"
     if issues:
-        return {"final": FALLBACK_MSG[s["language"]].format(n=EMERGENCY), "kind": "fallback", "llm_error": s.get("llm_error", ""),
-                "trace": log(s, f"Safety Checker: FAIL {issues} -> safe fallback")}
+        # Never leave the user with nothing: show the vetted standard guidance instead of the AI-written text
+        std = standard_guidance(s["topic"], s["risk"], s["text"])
+        return {"advice": std, "language": "en", "kind": "guidance", "llm_error": err,
+                "safety_note": "The AI-written answer did not pass the safety check (" + "; ".join(issues) + "), so standard guidance is shown instead.",
+                "trace": log(s, f"Safety Checker: FAIL {issues} -> standard guidance shown")}
     h = HEAD[s["language"]]
-    bullets = lambda xs: "\n".join(f"- {x}" for x in xs)
-    parts = [f"**{BANNER[s['risk']]}**", f"**{h[0]}**\n{a.get('understood', '')}", f"**{h[1]}**\n{a.get('relevant', '')}"]
-    if a.get("to_check"):
-        parts.append(f"**{h[2]}**\n{bullets(a['to_check'])}")
-    parts += [f"**{h[3]}**\n{bullets(a['do_now'])}", f"**{h[4]}**\n{bullets(a['warning_signs'])}", f"**{h[5]}**\n{a['next_step']}", f"_{DISCLAIMER}_"]
-    return {"final": "\n\n".join(parts), "kind": "guidance", "trace": log(s, "Safety Checker: PASS")}
+    return {"kind": "guidance", "trace": log(s, "Safety Checker: PASS")}
 
 
 def build_graph():
