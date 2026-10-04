@@ -2,6 +2,7 @@ import html
 
 import streamlit as st
 
+import agents
 from agents import HEAD, build_graph
 
 st.set_page_config(page_title="Sahaara AI", page_icon="🩺", layout="centered", initial_sidebar_state="collapsed")
@@ -136,6 +137,8 @@ if go:
     if out.get("llm_error"):
         st.error("⚠️ The AI service had a problem, so some results use built-in rules and standard guidance (English). "
                  f"Details: `{out['llm_error']}`. Please check GROQ_API_KEY under Settings → Secrets.")
+    if out.get("safety_note"):
+        st.info(out["safety_note"])
     risk = out["risk"]
     title, sub = TITLE[risk], SUB[risk]
     if out["kind"] == "fallback":
@@ -172,3 +175,13 @@ if go:
                         f' &nbsp;{html.escape(note.strip())}</div></div>', unsafe_allow_html=True)
     st.markdown('<div class="fine">Sahaara AI provides general early health information only. '
                 'It cannot diagnose conditions or replace professional medical care.</div>', unsafe_allow_html=True)
+
+with st.expander("Diagnostics"):
+    st.caption(f"agents.py version: {getattr(agents, 'VERSION', 'OLD agents.py (not updated)')}")
+    if st.button("Test AI connection"):
+        if hasattr(agents, "diagnose"):
+            res = agents.diagnose()
+            (st.success if "works" in res["status"] else st.error)(res["status"])
+            st.json(res)
+        else:
+            st.error("agents.py is the OLD version. Replace it on GitHub, then reboot the app.")
