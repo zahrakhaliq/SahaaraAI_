@@ -4,50 +4,166 @@ Workflow:
  Intake Agent -> Triage Agent -> (RED) Emergency Agent  -> END
                               -> (else) Advice Agent -> Referral Agent (report automation) -> Safety Checker -> END
 """
+import csv
 import json
 import os
 import re
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
 from groq import Groq
 from langgraph.graph import END, StateGraph
 
-VERSION = "2026-10-04-v3"
-MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+VERSION = "2026-10-04-v4"
+# llama-3.3-70b-versatile and llama-3.1-8b-instant were shut down on 2026-08-16.
+# Calling the old id is what made the deployed app fall back to built-in guidance.
+PRIMARY = "openai/gpt-oss-120b"
+BACKUP = "openai/gpt-oss-20b"
+RETIRED = {
+    "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192",
+    "llama3-8b-8192", "gemma2-9b-it", "llama-3.1-70b-versatile", "mixtral-8x7b-32768",
+}
 EMERGENCY = "1122 / 115"
+QUEUE_PATH = Path(__file__).resolve().parent / "data" / "referrals.csv"
+STATUSES = ["new", "contacted", "seen", "closed"]
+QUEUE_FIELDS = ["id", "created", "status", "risk", "topic", "age_group", "language",
+                "city", "symptoms", "facility", "referral", "report"]
 LANG_NAMES = {"en": "simple English", "ur": "Urdu (Urdu script)", "roman_ur": "Roman Urdu (Urdu in Latin letters)"}
 
 # ---------------------------------------------------------------- LLM helper
 _client = None
+_last_model = PRIMARY
+_models_tried: List[str] = []
+
+
+def _secret(name: str) -> str:
+    try:
+        import streamlit as st
+        val = st.secrets.get(name, "")
+        if val:
+            return str(val).strip()
+        blob = st.secrets.get("groq", {})
+        if isinstance(blob, dict):
+            return str(blob.get(name, "")).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def resolve_model(explicit: str = "") -> str:
+    """Pick a live Groq model. Retired ids (including the old default) map to PRIMARY."""
+    chosen = (explicit or os.getenv("GROQ_MODEL") or _secret("GROQ_MODEL") or "").strip()
+    if not chosen or chosen in RETIRED:
+        return PRIMARY
+    return chosen
+
+
+def current_model() -> str:
+    return _last_model
+
+
+def _client_obj():
+    global _client
+    if _client is None:
+        key = (os.getenv("GROQ_API_KEY") or "").strip() or _secret("GROQ_API_KEY")
+        if not key:
+            raise RuntimeError("GROQ_API_KEY is missing. Add it under Settings → Secrets, or set the environment variable.")
+        _client = Groq(api_key=key)
+    return _client
+
+
+def _retryable(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if any(s in msg for s in ("invalid api key", "invalid_api_key", "unauthorized", "401")):
+        return False
+    return True
+
+
+def _completion(model: str, messages: list, max_tokens: int, response_format=None, tools=None, tool_choice=None):
+    params: Dict[str, Any] = {"temperature": 0.1, "max_completion_tokens": max_tokens, "messages": messages}
+    if model.startswith("openai/gpt-oss") or model.startswith("qwen/"):
+        params["reasoning_effort"] = "low"
+    if response_format:
+        params["response_format"] = response_format
+    if tools:
+        params["tools"] = tools
+        params["tool_choice"] = tool_choice or "auto"
+    def _send(body):
+        return _client_obj().chat.completions.create(model=model, **body)
+
+    try:
+        return _send(params)
+    except TypeError:
+        params.pop("reasoning_effort", None)
+        if "max_completion_tokens" in params:
+            params["max_tokens"] = params.pop("max_completion_tokens")
+        return _send(params)
+    except Exception as e:
+        msg = str(e).lower()
+        if "reasoning_effort" in msg or "max_completion_tokens" in msg:
+            params.pop("reasoning_effort", None)
+            if "max_completion_tokens" in params:
+                params["max_tokens"] = params.pop("max_completion_tokens")
+            return _send(params)
+        raise
+
+
+def model_chain() -> List[str]:
+    chain = [resolve_model()]
+    for name in (PRIMARY, BACKUP):
+        if name not in chain:
+            chain.append(name)
+    return chain
+
+
+def _parse_json(text: str) -> dict:
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(m.group(0)) if m else None
+    if not isinstance(data, dict):
+        raise RuntimeError("model did not return a JSON object")
+    return data
 
 
 def ask_json(system: str, user: str, max_tokens: int = 1200) -> dict:
-    global _client
-    if _client is None:
-        key = os.getenv("GROQ_API_KEY")
-        if not key:
-            import streamlit as st
-            key = st.secrets["GROQ_API_KEY"]
-        _client = Groq(api_key=key)
-    r = _client.chat.completions.create(
-        model=MODEL, temperature=0.1, max_tokens=max_tokens, response_format={"type": "json_object"},
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-    text = r.choices[0].message.content or "{}"
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.S)
-        return json.loads(m.group(0)) if m else {}
+    global _last_model, _models_tried
+    _models_tried = []
+    last: Exception = RuntimeError("no model attempted")
+    for model in model_chain():
+        _models_tried.append(model)
+        try:
+            r = _completion(
+                model,
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                max_tokens,
+                response_format={"type": "json_object"},
+            )
+            text = (r.choices[0].message.content or "").strip()
+            if not text:
+                raise RuntimeError(f"empty response from {model}")
+            _last_model = model
+            return _parse_json(text)
+        except Exception as e:
+            last = e
+            if not _retryable(e):
+                break
+    raise last
 
 
 def diagnose() -> dict:
     """Tiny live test of the Groq connection (used by the Diagnostics panel in the UI)."""
-    info = {"version": VERSION, "model": MODEL}
+    info = {"version": VERSION, "model": resolve_model(), "backup": BACKUP,
+            "retired_blocked": "llama-3.3-70b-versatile"}
     try:
-        info["reply"] = ask_json('Reply with JSON {"ok": true}', "ping", 20)
-        info["status"] = "AI connection works"
+        info["reply"] = ask_json('Reply with JSON {"ok": true}', "ping", 256)
+        info["model_used"] = current_model()
+        info["status"] = f"AI connection works ({current_model()})"
     except Exception as e:
+        info["models_tried"] = list(_models_tried)
         info["status"] = f"AI connection FAILED: {type(e).__name__}: {str(e)[:300]}"
     return info
 
@@ -198,7 +314,146 @@ HEAD = {
     "ur": ["ہم نے کیا سمجھا", "کیا وجہ ہو سکتی ہے", "کیا چیک کریں", "ابھی آپ کیا کر سکتے ہیں", "خطرے کی علامات: فوراً مدد لیں اگر", "اگلا قدم"],
 }
 BANNER = {"green": "🟢 Lower concern", "yellow": "🟡 Needs medical evaluation", "red": "🔴 Urgent"}
-DISCLAIMER = "Sahaara AI gives early health information. It does not diagnose and does not replace a doctor."
+DISCLAIMER = ("Prototype. This guidance has not been clinically reviewed. "
+              "Sahaara AI does not diagnose and does not replace a doctor.")
+
+
+# ---------------------------------------------------------------- facility tool + referral log
+FACILITIES = [
+    {"city": "karachi", "name": "Jinnah Postgraduate Medical Centre (JPMC)", "level": "tertiary emergency"},
+    {"city": "karachi", "name": "Dr Ruth K. M. Pfau Civil Hospital", "level": "tertiary emergency"},
+    {"city": "lahore", "name": "Mayo Hospital", "level": "tertiary emergency"},
+    {"city": "lahore", "name": "Services Hospital", "level": "tertiary emergency"},
+    {"city": "islamabad", "name": "Pakistan Institute of Medical Sciences (PIMS)", "level": "tertiary emergency"},
+    {"city": "islamabad", "name": "Federal Government Polyclinic", "level": "hospital"},
+    {"city": "rawalpindi", "name": "Benazir Bhutto Hospital", "level": "tertiary emergency"},
+    {"city": "rawalpindi", "name": "Holy Family Hospital", "level": "tertiary emergency"},
+    {"city": "peshawar", "name": "Lady Reading Hospital", "level": "tertiary emergency"},
+    {"city": "quetta", "name": "Civil Hospital Quetta", "level": "tertiary emergency"},
+    {"city": "multan", "name": "Nishtar Hospital", "level": "tertiary emergency"},
+    {"city": "faisalabad", "name": "Allied Hospital", "level": "tertiary emergency"},
+    {"city": "hyderabad", "name": "Liaquat University Hospital", "level": "tertiary emergency"},
+]
+
+LOOKUP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "lookup_facilities",
+        "description": "Look up public hospitals for a city and urgency. Use this before naming a facility.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "Patient city or town"},
+                "risk": {"type": "string", "enum": ["green", "yellow", "red"]},
+                "topic": {"type": "string"},
+            },
+            "required": ["city", "risk", "topic"],
+        },
+    },
+}
+
+PROMPTS = {
+    "duration": {
+        "en": "How long have you had this?",
+        "roman_ur": "Yeh masla kab se hai?",
+        "ur": "یہ مسئلہ کب سے ہے؟",
+    },
+    "city": {
+        "en": "Which city are you in? A facility is looked up from your answer.",
+        "roman_ur": "Aap kis sheher mein hain? Jawab se qareebi facility dhoondi jayegi.",
+        "ur": "آپ کس شہر میں ہیں؟ جواب سے قریبی سہولت تلاش کی جائے گی۔",
+    },
+}
+
+
+def lookup_facilities(city: str, risk: str, topic: str) -> dict:
+    """Local directory behind the lookup_facilities tool. No invented phone numbers."""
+    city_l = (city or "").strip().lower()
+    hits = [f for f in FACILITIES if city_l and (f["city"] in city_l or city_l in f["city"])]
+    if hits:
+        note = "Public facilities from the built-in directory. Confirm the department on arrival."
+    else:
+        hits = [f for f in FACILITIES if "emergency" in f["level"]][:4]
+        note = "That city is not in the directory. Showing major public emergency hospitals. Call 1122 for an ambulance."
+    if risk == "red":
+        hits = sorted(hits, key=lambda f: 0 if "emergency" in f["level"] else 1)
+    hits = hits[:3]
+    chosen = hits[0] if hits else {}
+    return {"city": city or "", "risk": risk, "topic": topic, "matches": hits,
+            "chosen": chosen.get("name", ""), "chosen_city": chosen.get("city", ""),
+            "level": chosen.get("level", ""), "note": note}
+
+
+def invoke_lookup(city: str, risk: str, topic: str) -> dict:
+    """Force the live model to call lookup_facilities, then run that tool."""
+    global _last_model
+    messages = [
+        {"role": "system", "content": "You are the Facility Agent. Call lookup_facilities once. Do not answer in prose."},
+        {"role": "user", "content": json.dumps({"city": city, "risk": risk, "topic": topic})},
+    ]
+    last: Exception = RuntimeError("no model attempted")
+    for model in model_chain():
+        try:
+            r = _completion(
+                model, messages, 400, tools=[LOOKUP_TOOL],
+                tool_choice={"type": "function", "function": {"name": "lookup_facilities"}},
+            )
+            msg = r.choices[0].message
+            calls = getattr(msg, "tool_calls", None) or []
+            if not calls:
+                raise RuntimeError(f"{model} did not call lookup_facilities")
+            args = json.loads(calls[0].function.arguments or "{}")
+            found = lookup_facilities(args.get("city") or city, args.get("risk") or risk, args.get("topic") or topic)
+            found["via"] = "groq"
+            found["model"] = model
+            _last_model = model
+            return found
+        except Exception as e:
+            last = e
+            if not _retryable(e):
+                break
+    raise last
+
+
+def _write_queue(rows: List[dict]) -> None:
+    QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with QUEUE_PATH.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=QUEUE_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def log_case(row: Dict[str, str]) -> str:
+    case_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    record = {k: "" for k in QUEUE_FIELDS}
+    record.update({k: "" if row.get(k) is None else str(row.get(k)) for k in QUEUE_FIELDS})
+    record["id"] = case_id
+    record["created"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    record["status"] = "new"
+    try:
+        rows = list_cases()
+        rows.append(record)
+        _write_queue(rows)
+    except Exception:
+        return ""
+    return case_id
+
+
+def list_cases() -> List[dict]:
+    if not QUEUE_PATH.exists():
+        return []
+    with QUEUE_PATH.open(newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def update_status(case_id: str, status: str) -> None:
+    if status not in STATUSES:
+        return
+    rows = list_cases()
+    for row in rows:
+        if row.get("id") == case_id:
+            row["status"] = status
+    _write_queue(rows)
 
 
 # ---------------------------------------------------------------- workflow state
@@ -224,10 +479,45 @@ class State(TypedDict, total=False):
     trace: List[str]
     llm_error: str
     safety_note: str
+    city: str
+    duration_hint: str
+    followup_done: bool
+    questions: List[Dict[str, str]]
+    facility: Dict[str, Any]
+    case_id: str
+    source: str
+    model_used: str
 
 
 def log(s: State, msg: str) -> List[str]:
     return s.get("trace", []) + [msg]
+
+
+def guess_duration(text: str) -> str:
+    m = re.search(
+        r"(\d+\s*(?:day|days|din|hour|hours|ghante|ghanta|ghantay|week|weeks|hafte|hafta|haftay|month|months|mahine|mahina|minute|minutes))"
+        r"|(\b(?:subah se|shaam se|kal se|aaj se|kai din|chand din|do din|teen din|since morning|since yesterday|since last night|for a few days)\b)",
+        text, re.I)
+    return (m.group(0).strip() if m else "")
+
+
+def guess_city(text: str) -> str:
+    t = text.lower()
+    for city in sorted({f["city"] for f in FACILITIES}, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(city)}\b", t):
+            return city.title()
+    return ""
+
+
+def missing_keys(s: State) -> List[str]:
+    if s.get("followup_done") or s.get("risk") == "red":
+        return []
+    missing = []
+    if not (s.get("duration") or "").strip():
+        missing.append("duration")
+    if not (s.get("city") or "").strip():
+        missing.append("city")
+    return missing[:2]
 
 
 # ---------------------------------------------------------------- agents
@@ -241,18 +531,27 @@ Never diagnose. Never invent facts."""
 def intake_agent(s: State):
     err = ""
     try:
-        d = ask_json(INTAKE_SYSTEM, f"Age group: {s['age_group']}\nMeasured values: {s['measures']}\nUser text: {s['text']}", 500)
+        d = ask_json(INTAKE_SYSTEM,
+                     f"Age group: {s['age_group']}\nCity: {s.get('city') or ''}\n"
+                     f"Duration already given: {s.get('duration_hint') or ''}\n"
+                     f"Measured values: {s['measures']}\nUser text: {s['text']}", 700)
     except Exception as e:
         d, err = {}, f"{type(e).__name__}: {str(e)[:220]}"
     lang = s.get("lang_pref") if s.get("lang_pref") in LANG_NAMES else d.get("language")
     topic = d.get("topic") if d.get("topic") in KB and d.get("topic") != "other" else guess_topic(s["text"])
     symptoms = d.get("symptoms") or ([topic.replace("_", " ")] if topic != "other" else [])
+    duration = (d.get("duration") or s.get("duration_hint") or guess_duration(s["text"]) or "").strip()
+    city = (s.get("city") or guess_city(s["text"]) or "").strip()
     out = {"language": lang if lang in LANG_NAMES else guess_lang(s["text"]), "symptoms": symptoms,
-           "duration": d.get("duration") or "", "guesses": d.get("guesses") or [], "topic": topic,
+           "duration": duration, "city": city, "guesses": d.get("guesses") or [], "topic": topic,
            "llm_emergency": d.get("emergency_suspected") or "", "needs_doctor": bool(d.get("needs_doctor")),
-           "trace": log(s, f"Intake Agent: topic={topic}, symptoms={symptoms}" + (" (AI unavailable: rule-based fallback)" if err else ""))}
+           "trace": log(s, f"Intake Agent: topic={topic}, duration={duration or 'missing'}, city={city or 'missing'}"
+                        + (f" (Groq error: {err})" if err else f" (Groq {current_model()})"))}
     if err:
         out["llm_error"] = err
+    else:
+        out["llm_error"] = ""
+        out["model_used"] = current_model()
     return out
 
 
@@ -273,13 +572,53 @@ def triage_agent(s: State):
 
 
 def route_triage(s: State):
-    return "emergency" if s["risk"] == "red" else "advice"
+    if s["risk"] == "red":
+        return "emergency"
+    if missing_keys(s):
+        return "followup"
+    return "advice"
+
+
+def followup_agent(s: State):
+    keys = missing_keys(s)
+    lang = s.get("language") if s.get("language") in LANG_NAMES else "en"
+    questions = [{"id": k, "prompt": PROMPTS[k][lang]} for k in keys]
+    return {"questions": questions, "kind": "clarify",
+            "trace": log(s, "Follow-up Agent: asked " + ", ".join(keys))}
+
+
+def _facility(s: State):
+    city, risk, topic = s.get("city") or "", s.get("risk") or "yellow", s.get("topic") or "other"
+    try:
+        found = invoke_lookup(city, risk, topic)
+        via = f"Groq tool call ({found.get('model') or current_model()})"
+        err = ""
+    except Exception as e:
+        found = lookup_facilities(city, risk, topic)
+        found["via"] = "local"
+        via = "local tool"
+        err = f"{type(e).__name__}: {str(e)[:160]}"
+    note = f"Facility Agent: {via} lookup_facilities -> {found.get('chosen') or 'none'}"
+    if err:
+        note += f" [{err}]"
+    return found, note
 
 
 def emergency_agent(s: State):
+    found, note = _facility(s)
     msg = EMERGENCY_MSG[s["language"]].format(n=EMERGENCY)
     msg += "\n\n_Reason (English): " + "; ".join(s["red"]) + "_"
-    return {"final": msg, "kind": "emergency", "trace": log(s, "Emergency Agent: static emergency message (workflow interrupted)")}
+    if found.get("chosen"):
+        where = found["chosen"] + (f" ({found['chosen_city'].title()})" if found.get("chosen_city") else "")
+        msg += f"\n\nListed emergency hospital: {where}."
+    case_id = log_case({
+        "risk": "red", "topic": s.get("topic", ""), "age_group": s.get("age_group", ""),
+        "language": s.get("language", ""), "city": s.get("city", ""),
+        "symptoms": ", ".join(s.get("symptoms") or []) or s.get("text", "")[:120],
+        "facility": found.get("chosen", ""), "referral": "Emergency now", "report": msg,
+    })
+    return {"final": msg, "kind": "emergency", "facility": found, "case_id": case_id,
+            "trace": log(s, "Emergency Agent: static emergency message; " + note)}
 
 
 ADVICE_SYSTEM = """You are the Advice Agent of a safety-first health-support tool for people with limited access to care. NEVER diagnose, NEVER prescribe.
@@ -301,25 +640,44 @@ def advice_agent(s: State):
         a, err = {}, f"{type(e).__name__}: {str(e)[:220]}"
     if not (a.get("do_now") and a.get("warning_signs") and a.get("next_step")):
         a = standard_guidance(s["topic"], s["risk"], s["text"])
-        note = "Advice Agent: AI unavailable, using vetted standard guidance (English)"
+        note = ("Advice Agent: Groq error, draft standard guidance shown" if err
+                else "Advice Agent: Groq reply was incomplete, draft standard guidance shown")
     else:
-        note = "Advice Agent: guidance generated from guidelines"
-    out = {"advice": a, "trace": log(s, note)}
-    if err:
+        note = f"Advice Agent: guidance generated from guidelines (Groq {current_model()})"
+    out = {"advice": a, "source": "standard" if a.get("degraded") else "groq", "trace": log(s, note)}
+    if not a.get("degraded"):
+        out["model_used"] = current_model()
+        out["llm_error"] = ""
+    elif err:
         out["llm_error"] = err
     return out
 
 
+def facility_agent(s: State):
+    found, note = _facility(s)
+    extra = {}
+    if found.get("via") == "groq":
+        extra["model_used"] = found.get("model") or current_model()
+    return {"facility": found, "trace": log(s, note), **extra}
+
+
 def referral_agent(s: State):
-    """Business-process automation: builds the referral level and a doctor-ready case report."""
+    """Logs the case to the referral queue and builds the handoff report."""
     m = s.get("measures", {})
     show = lambda k, u: f"{m[k]:.4g} {u}" if m.get(k) else "not provided"
     bp = f"{m['bp_sys']:.0f}/{m['bp_dia']:.0f}" if m.get("bp_sys") and m.get("bp_dia") else "not provided"
-    level = ("Visit a clinic/health centre TODAY" if s["risk"] == "yellow" else "Home care + monitoring; visit a clinic if no improvement in 48 h")
+    level = ("Visit a clinic or hospital TODAY" if s["risk"] == "yellow"
+             else "Home care and monitoring; visit a clinic if no improvement in 48 hours")
+    fac = s.get("facility") or {}
+    facility_line = fac.get("chosen") or "not matched"
+    if fac.get("chosen_city"):
+        facility_line += f" ({fac['chosen_city'].title()})"
     report = "\n".join([
-        "SAHAARA AI - CASE REPORT (not a diagnosis)",
+        "SAHAARA AI — PROTOTYPE CASE REPORT",
+        "Not a diagnosis. Guidance has not been clinically reviewed.",
         f"Generated: {datetime.now():%Y-%m-%d %H:%M}",
         f"Patient age group: {s['age_group']}",
+        f"City: {s.get('city') or 'not stated'}",
         f"Main complaint: {', '.join(s.get('symptoms') or []) or s['text'][:120]}",
         f"Duration: {s.get('duration') or 'not stated'}",
         f"Measured: BP {bp} | Glucose {show('glucose', 'mg/dL')} | Temp {show('temp_c', 'C')} | SpO2 {show('spo2', '%')}",
@@ -327,8 +685,19 @@ def referral_agent(s: State):
         f"Alerts: {'; '.join(s['yellow']) or 'none'}",
         f"Triage level: {s['risk'].upper()}",
         f"Recommended referral: {level}",
+        f"Facility (lookup_facilities): {facility_line}",
+        f"Model: {s.get('model_used') or 'not used'}",
     ])
-    return {"report": report, "trace": log(s, f"Referral Agent: report generated, referral='{level}'")}
+    case_id = log_case({
+        "risk": s.get("risk", ""), "topic": s.get("topic", ""), "age_group": s.get("age_group", ""),
+        "language": s.get("language", ""), "city": s.get("city", ""),
+        "symptoms": ", ".join(s.get("symptoms") or []) or s.get("text", "")[:160],
+        "facility": fac.get("chosen", ""), "referral": level, "report": report,
+    })
+    if case_id:
+        report += f"\nQueue id: {case_id}"
+    return {"report": report, "case_id": case_id,
+            "trace": log(s, f"Referral Agent: queued {case_id or 'unlogged'}, referral='{level}'")}
 
 
 DOSE = re.compile(r"\b\d+(\.\d+)?\s?(mg|mcg|iu)\b", re.I)
@@ -360,32 +729,39 @@ def safety_agent(s: State):
     err = s.get("llm_error", "")
     if not issues:
         try:
-            r = ask_json(CHECK_SYSTEM, json.dumps({"GUIDELINES": KB[s["topic"]], "ADVICE": a}, ensure_ascii=False), 300)
+            r = ask_json(CHECK_SYSTEM, json.dumps({"GUIDELINES": KB[s["topic"]], "ADVICE": a}, ensure_ascii=False), 600)
             if not _passed(r):
-                issues += [str(i) for i in (r.get("issues") or ["checker did not approve"])]
+                flagged = [str(i) for i in (r.get("issues") or ["checker did not approve"])]
+                return {"kind": "guidance",
+                        "safety_note": "The safety checker flagged this draft (" + "; ".join(flagged) + "). The Groq answer is still shown. It has not been clinically reviewed.",
+                        "trace": log(s, f"Safety Checker: flagged {flagged}; Groq answer kept")}
         except Exception as e:
-            issues.append("checker unavailable")
-            err = err or f"{type(e).__name__}: {str(e)[:220]}"
+            # A failed checker must not hide a Groq answer that already passed the local rules.
+            return {"kind": "guidance",
+                    "safety_note": "The safety checker could not reach Groq (" + f"{type(e).__name__}: {str(e)[:160]}" + "). The advice above was not replaced.",
+                    "trace": log(s, "Safety Checker: Groq checker unavailable; local checks passed, advice kept")}
     if issues:
         # Never leave the user with nothing: show the vetted standard guidance instead of the AI-written text
         std = standard_guidance(s["topic"], s["risk"], s["text"])
-        return {"advice": std, "language": "en", "kind": "guidance", "llm_error": err,
-                "safety_note": "The AI-written answer did not pass the safety check (" + "; ".join(issues) + "), so standard guidance is shown instead.",
+        return {"advice": std, "language": "en", "kind": "guidance", "source": "standard", "llm_error": err,
+                "safety_note": "The AI-written answer did not pass the safety check (" + "; ".join(issues) + "), so draft standard guidance is shown instead.",
                 "trace": log(s, f"Safety Checker: FAIL {issues} -> standard guidance shown")}
-    h = HEAD[s["language"]]
-    return {"kind": "guidance", "trace": log(s, "Safety Checker: PASS")}
+    return {"kind": "guidance", "model_used": current_model(), "trace": log(s, f"Safety Checker: PASS ({current_model()})")}
 
 
 def build_graph():
     g = StateGraph(State)
-    for name, fn in [("intake", intake_agent), ("triage", triage_agent), ("emergency", emergency_agent),
-                     ("advice", advice_agent), ("referral", referral_agent), ("safety", safety_agent)]:
+    for name, fn in [("intake", intake_agent), ("triage", triage_agent), ("followup", followup_agent),
+                     ("emergency", emergency_agent), ("advice", advice_agent), ("facility", facility_agent),
+                     ("referral", referral_agent), ("safety", safety_agent)]:
         g.add_node(name, fn)
     g.set_entry_point("intake")
     g.add_edge("intake", "triage")
-    g.add_conditional_edges("triage", route_triage, {"emergency": "emergency", "advice": "advice"})
-    g.add_edge("advice", "referral")
-    g.add_edge("referral", "safety")
+    g.add_conditional_edges("triage", route_triage, {"emergency": "emergency", "followup": "followup", "advice": "advice"})
+    g.add_edge("followup", END)
     g.add_edge("emergency", END)
+    g.add_edge("advice", "facility")
+    g.add_edge("facility", "referral")
+    g.add_edge("referral", "safety")
     g.add_edge("safety", END)
     return g.compile()
