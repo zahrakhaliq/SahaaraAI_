@@ -9,7 +9,8 @@ st.set_page_config(page_title="Sahaara AI", page_icon="🩺", layout="centered",
 st.markdown("""
 <style>
 #MainMenu, footer, header [data-testid="stToolbar"], [data-testid="stSidebar"], [data-testid="collapsedControl"] {display: none !important;}
-.block-container {max-width: 820px; padding-top: 1.2rem; padding-bottom: 3rem;}
+header[data-testid="stHeader"] {display: none !important;}
+.block-container {max-width: 820px; padding-top: 2rem; padding-bottom: 3rem;}
 .topbar {display: flex; justify-content: space-between; align-items: center; padding: 10px 0 14px;
          border-bottom: 1px solid rgba(128,128,128,.25); margin-bottom: 22px;}
 .brand {font-size: 1.35rem; font-weight: 700; letter-spacing: -.01em;}
@@ -45,10 +46,20 @@ div[data-testid="stFormSubmitButton"] button:hover {background: #155E75; color: 
 div[data-testid="stForm"] {border: 1px solid rgba(128,128,128,.25); border-radius: 12px; padding: 18px 20px;}
 div.stButton > button {border-radius: 8px; font-size: .85rem;}
 textarea {border-radius: 8px !important;}
+.logo-wrap {text-align: center; padding: 8px 0 22px; border-bottom: 1px solid rgba(128,128,128,.25); margin-bottom: 26px;}
+.logo-wrap .name {font-size: 2.4rem; font-weight: 800; letter-spacing: -.02em; line-height: 1.1; margin-top: 10px;}
+.logo-wrap .name span {color: #0E7490;}
+.logo-wrap .urdu {font-size: 1.5rem; color: #0E7490; margin-top: 2px;}
+.logo-wrap .tagline {font-size: 1.02rem; opacity: .75; margin-top: 4px;}
+.logo-wrap .langs {font-size: .8rem; opacity: .55; margin-top: 8px;}
+.title {text-align: center;}
+.lead {text-align: center;}
 </style>
-<div class="topbar"><div class="brand">🩺 Sahaara<span> AI</span></div>
-<div class="meta">Early health support &nbsp;·&nbsp; English &nbsp;·&nbsp; اردو &nbsp;·&nbsp; Roman Urdu</div></div>
-<div class="title">Describe how you are feeling</div>
+""", unsafe_allow_html=True)
+
+LOGO = """<div class="logo-wrap"><svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><rect width="64" height="64" rx="16" fill="#0E7490"/><path d="M26 12h12v12h12v12H38v12H26V36H14V24h12z" fill="#fff"/><path d="M12 54c10 6 30 6 40 0" stroke="#A5F3FC" stroke-width="3" fill="none" stroke-linecap="round"/></svg><div class="name">Sahaara <span>AI</span></div><div class="urdu">سہارا</div><div class="tagline">Your first step to safe care</div><div class="langs">English &nbsp;·&nbsp; اردو &nbsp;·&nbsp; Roman Urdu</div></div>"""
+st.markdown(LOGO, unsafe_allow_html=True)
+st.markdown("""<div class="title">Describe how you are feeling</div>
 <div class="lead">Tell us in your own words. Sahaara checks for warning signs, suggests safe next steps and prepares a report for your doctor.</div>
 <div class="notice"><b>Emergency?</b> Call <b>1122 / 115</b> or go to the nearest hospital. Sahaara AI does not diagnose and does not replace a doctor.</div>
 """, unsafe_allow_html=True)
